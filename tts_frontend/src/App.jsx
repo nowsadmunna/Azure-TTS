@@ -79,7 +79,12 @@ export default function App() {
         body: formData,
       });
 
-      if (!res.ok) throw new Error('Assessment failed');
+    if (!res.ok) {
+  const errorData = await res.json();
+  console.error('Azure response:', errorData);
+  throw new Error(errorData.details || 'Assessment failed');
+}
+
       
       const data = await res.json();
       const score = data.result.AccuracyScore;

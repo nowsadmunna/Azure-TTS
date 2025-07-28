@@ -7,11 +7,28 @@ import path from 'path';
 import os from 'os';
 import ffmpeg from 'fluent-ffmpeg';
 import dotenv from 'dotenv';
-
+import sdk from 'microsoft-cognitiveservices-speech-sdk';
+import { Readable } from 'stream';
 dotenv.config();
-const app = express();
 
-// Configure upload directory
+// Set FFmpeg paths
+const ffmpegPath = 'D:\\Downloads\\ffmpeg-7.1.1-essentials_build\\ffmpeg-7.1.1-essentials_build\\bin\\ffmpeg.exe';
+const ffprobePath = 'D:\\Downloads\\ffmpeg-7.1.1-essentials_build\\ffmpeg-7.1.1-essentials_build\\bin\\ffprobe.exe';
+
+ffmpeg.setFfmpegPath(ffmpegPath);
+ffmpeg.setFfprobePath(ffprobePath);
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+const PORT = process.env.PORT || 4000;
+const AZURE_KEY = process.env.AZURE_KEY;
+const AZURE_REGION = process.env.AZURE_REGION;
+const AZURE_TTS_URL = `https://${AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`;
+const AZURE_ASSESS_URL = `https://${AZURE_REGION}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=en-US`;
+
+// Upload setup
 const uploadDir = path.resolve('uploads');
 await fs.mkdir(uploadDir, { recursive: true });
 
@@ -29,76 +46,35 @@ const upload = multer({
   }
 });
 
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
-const PORT = process.env.PORT || 4000;
-const AZURE_KEY = process.env.AZURE_KEY;
-const AZURE_REGION = process.env.AZURE_REGION;
-const AZURE_TTS_URL = `https://${AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`;
-const AZURE_ASSESS_URL = `https://${AZURE_REGION}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=en-US`;
-
+// SSML helper
 const createSsml = (text) => `
 <speak version='1.0' xml:lang='en-US'>
   <voice xml:lang='en-US' name='en-US-AriaNeural'>${text}</voice>
 </speak>
 `;
 
+// Convert audio to WAV format
 async function convertAudioToWav(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-    let ffmpegCommand;
-    
-    const cleanup = () => {
-      if (ffmpegCommand) {
-        ffmpegCommand.kill('SIGKILL');
-      }
-    };
-
-    const timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error('Audio conversion timed out'));
-    }, 30000);
-
-    ffmpeg.ffprobe(inputPath, (err, metadata) => {
-      if (err) {
-        clearTimeout(timeout);
-        return reject(new Error(`Invalid audio file: ${err.message}`));
-      }
-
-      const inputFormat = metadata.format.format_name.includes('webm') ? 'webm' : 
-                         metadata.format.format_name.includes('ogg') ? 'ogg' : 
-                         'wav';
-
-      console.log(`Converting ${path.basename(inputPath)} (${inputFormat}) to WAV`);
-
-      ffmpegCommand = ffmpeg(inputPath)
-        .inputFormat(inputFormat)
-        .audioCodec('pcm_s16le')
-        .audioFrequency(16000)
-        .audioChannels(1)
-        .outputOptions([
-          '-ar 16000',
-          '-ac 1',
-          '-f wav',
-          '-y'
-        ])
-        .on('start', (cmd) => console.log('FFmpeg command:', cmd))
-        .on('error', (err) => {
-          clearTimeout(timeout);
-          cleanup();
-          console.error('FFmpeg error:', err.message);
-          reject(new Error('Failed to process audio. Please try recording again.'));
-        })
-        .on('end', () => {
-          clearTimeout(timeout);
-          console.log('Conversion successful');
-          resolve();
-        })
-        .save(outputPath);
-    });
+    ffmpeg(inputPath)
+      .audioCodec('pcm_s16le')
+      .audioFrequency(16000)
+      .audioChannels(1)
+      .format('wav')
+      .on('start', (cmd) => console.log('FFmpeg command:', cmd))
+      .on('end', () => {
+        console.log('Conversion successful');
+        resolve();
+      })
+      .on('error', (err) => {
+        console.error('FFmpeg error:', err.message);
+        reject(new Error('Failed to convert audio to WAV'));
+      })
+      .save(outputPath);
   });
 }
 
+// TTS Endpoint
 app.post('/api/tts', async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'Text is required' });
@@ -117,12 +93,14 @@ app.post('/api/tts', async (req, res) => {
     res.json({ audioBase64: base64Audio });
   } catch (error) {
     console.error('TTS Error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to generate speech' });
+    res.status(500).json({ error: 'TTS failed' });
   }
 });
 
+// Pronunciation Assessment
 app.post('/api/assess', upload.single('audio'), async (req, res) => {
   const { text } = req.body;
+
   if (!text || !req.file) {
     return res.status(400).json({ error: 'Text and audio file are required' });
   }
@@ -131,10 +109,12 @@ app.post('/api/assess', upload.single('audio'), async (req, res) => {
   const wavPath = path.join(os.tmpdir(), `${Date.now()}.wav`);
 
   try {
-    // Verify audio duration
+    await fs.access(audioPath);
+    console.log('✅ Uploaded file found');
+
     const metadata = await new Promise((resolve, reject) => {
       ffmpeg.ffprobe(audioPath, (err, data) => {
-        if (err) reject(new Error('Invalid audio file'));
+        if (err) reject(err);
         else resolve(data);
       });
     });
@@ -143,55 +123,53 @@ app.post('/api/assess', upload.single('audio'), async (req, res) => {
       throw new Error('Audio must be at least 1 second long');
     }
 
+    console.log('Converting to WAV...');
     await convertAudioToWav(audioPath, wavPath);
 
-    // Verify output file
-    const wavStats = await fs.stat(wavPath);
-    if (wavStats.size === 0) throw new Error('Conversion failed - empty file');
+    const audioBuffer = await fs.readFile(wavPath);
+    const pushStream = sdk.AudioInputStream.createPushStream();
+    pushStream.write(audioBuffer);
+    pushStream.close();
 
-    const wavBuffer = await fs.readFile(wavPath);
+    const speechConfig = sdk.SpeechConfig.fromSubscription(AZURE_KEY, AZURE_REGION);
+    speechConfig.speechRecognitionLanguage = 'en-US';
 
-    const headers = {
-      'Ocp-Apim-Subscription-Key': AZURE_KEY,
-      'Content-Type': 'audio/wav; codec=audio/pcm; samplerate=16000',
-      'Pronunciation-Assessment': JSON.stringify({
-        ReferenceText: text,
-        GradingSystem: 'HundredMark',
-        Granularity: 'Word',
-        Dimension: 'Comprehensive',
-        EnableMiscue: 'True'
-      })
-    };
+    // 👇 Enable Pronunciation Assessment
+    const pronConfig = new sdk.PronunciationAssessmentConfig(
+      text,
+      sdk.PronunciationAssessmentGradingSystem.HundredMark,
+      sdk.PronunciationAssessmentGranularity.Word,
+      true // enable miscue calculation
+    );
 
-    console.log('Sending to Azure...');
-    const response = await axios.post(AZURE_ASSESS_URL, wavBuffer, {
-      headers,
-      timeout: 20000,
-      validateStatus: () => true
+    const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
+    const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
+
+    pronConfig.applyTo(recognizer);
+
+    console.log('🔍 Sending audio to Azure SDK...');
+    recognizer.recognizeOnceAsync(result => {
+      console.log('🧠 Recognition Result:', result);
+
+      if (result.reason === sdk.ResultReason.RecognizedSpeech) {
+        const assessmentResult = sdk.PronunciationAssessmentResult.fromResult(result);
+        const output = {
+          AccuracyScore: assessmentResult.accuracyScore,
+          FluencyScore: assessmentResult.fluencyScore,
+          CompletenessScore: assessmentResult.completenessScore,
+          PronunciationScore: assessmentResult.pronunciationScore,
+        };
+
+        res.json({ result: output });
+      } else {
+        console.error('❌ Recognition failed:', result.errorDetails);
+        res.status(500).json({ error: 'Recognition failed', details: result.errorDetails });
+      }
     });
 
-    if (response.status !== 200) {
-      console.error('Azure Error:', {
-        status: response.status,
-        data: response.data,
-        headers: response.headers
-      });
-      throw new Error(`Azure service error: ${response.status}`);
-    }
-
-    if (!response.data.NBest?.[0]?.PronunciationAssessment) {
-      throw new Error('Invalid assessment response format');
-    }
-
-    res.json({ result: response.data.NBest[0].PronunciationAssessment });
-  } catch (error) {
-    console.error('Assessment Error:', error.message);
-    
-    res.status(500).json({ 
-      error: 'Assessment failed',
-      details: error.message,
-      suggestion: 'Please try recording again in a quiet environment'
-    });
+  } catch (err) {
+    console.error('Assessment Error:', err.message);
+    res.status(500).json({ error: 'Assessment failed', details: err.message });
   } finally {
     await Promise.all([
       fs.unlink(audioPath).catch(() => {}),
@@ -200,11 +178,28 @@ app.post('/api/assess', upload.single('audio'), async (req, res) => {
   }
 });
 
+// Azure Health Check
+app.get('/test-azure', async (req, res) => {
+  try {
+    const response = await axios.post(AZURE_TTS_URL, createSsml('test'), {
+      headers: {
+        'Ocp-Apim-Subscription-Key': AZURE_KEY,
+        'Content-Type': 'application/ssml+xml',
+        'X-Microsoft-OutputFormat': 'audio-16khz-32kbitrate-mono-mp3',
+      },
+      responseType: 'arraybuffer',
+    });
+
+    res.json({ status: 'Azure TTS OK', length: response.data.byteLength });
+  } catch (err) {
+    res.status(500).json({ status: 'Azure TTS FAILED', error: err.message });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy' });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Backend running at http://localhost:${PORT}`);
-  console.log('✅ FFmpeg ready');
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
