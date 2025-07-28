@@ -1,150 +1,93 @@
-import { useState, useRef } from 'react';
+import { useState } from 'react';
+import './App.css';
+import { useTTS } from './hooks/useTTS.js';
+import { useAudioRecording } from './hooks/useAudioRecording.js';
+import { useAssessment } from './hooks/useAssessment.js';
+import { TTSSection } from './components/TTSSection.jsx';
+import { RecordingSection } from './components/RecordingSection.jsx';
+import { AudioPlayback } from './components/AudioPlayback.jsx';
+import { AssessmentResults } from './components/AssessmentResults.jsx';
 
 export default function App() {
   const [text, setText] = useState('Apple');
-  const [audioSrc, setAudioSrc] = useState(null);
-  const [recording, setRecording] = useState(false);
-  const [recordedAudioUrl, setRecordedAudioUrl] = useState(null);
-  const [recordedAudioBlob, setRecordedAudioBlob] = useState(null);
-  const [uploadedFile, setUploadedFile] = useState(null);
-  const fileInputRef = useRef(null);
+  
+  // Custom hooks for different functionalities
+  const tts = useTTS();
+  const recording = useAudioRecording();
+  const assessment = useAssessment();
 
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-
-  const getTtsAudio = async () => {
-    const res = await fetch('http://localhost:4000/api/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
-    const data = await res.json();
-    setAudioSrc(`data:audio/mp3;base64,${data.audioBase64}`);
-  };
-
-  const playTts = () => {
-    if (audioSrc) new Audio(audioSrc).play();
-  };
-
-  const startRecording = async () => {
-    setRecording(true);
-    audioChunksRef.current = [];
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorderRef.current = new MediaRecorder(stream);
-
-    mediaRecorderRef.current.ondataavailable = (e) => {
-      if (e.data.size > 0) audioChunksRef.current.push(e.data);
-    };
-
-    mediaRecorderRef.current.onstop = () => {
-      const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-      const url = URL.createObjectURL(blob);
-      setRecordedAudioUrl(url);
-      setRecordedAudioBlob(blob);
-      setRecording(false);
-    };
-
-    mediaRecorderRef.current.start();
-  };
-
-  const stopRecording = () => {
-    mediaRecorderRef.current.stop();
-  };
-
-  const handleFileUpload = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    
-    if (!file.type.includes('audio/')) {
-      alert('Please upload an audio file');
-      return;
-    }
-
-    setUploadedFile(file);
-    setRecordedAudioUrl(URL.createObjectURL(file));
-    setRecordedAudioBlob(file);
-  };
-
-  const uploadForAssessment = async () => {
-    const audioBlob = recordedAudioBlob;
-    if (!audioBlob) return alert('No recording available');
-    
-    const formData = new FormData();
-    formData.append('audio', audioBlob, audioBlob.name || 'recording.webm');
-    formData.append('text', text);
-
+  const handleAssessment = async () => {
     try {
-      const res = await fetch('http://localhost:4000/api/assess', {
-        method: 'POST',
-        body: formData,
-      });
-
-    if (!res.ok) {
-  const errorData = await res.json();
-  console.error('Azure response:', errorData);
-  throw new Error(errorData.details || 'Assessment failed');
-}
-
+      const result = await assessment.performAssessment(recording.audioBlob, text);
+      const score = assessment.formatScore(result.AccuracyScore);
+      const { emoji, message } = assessment.getScoreMessage(score);
       
-      const data = await res.json();
-      const score = data.result.AccuracyScore;
-      if (score >= 80) alert(`🎉 Well done! Score: ${score}`);
-      else alert(`🧸 Try again. Score: ${score}`);
+      // Show user-friendly alert
+      alert(`${emoji} ${message} Score: ${score}%`);
     } catch (error) {
-      alert('Error during assessment: ' + error.message);
+      alert(`Assessment failed: ${error.message}`);
     }
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>🧠 Speech Therapy App</h2>
-      <input
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder="Type a word"
-        style={{ padding: 8, width: '100%' }}
+    <div style={{ 
+      maxWidth: '800px', 
+      margin: '0 auto', 
+      padding: '20px',
+      fontFamily: 'system-ui, -apple-system, sans-serif'
+    }}>
+      {/* Text-to-Speech Section */}
+      <TTSSection
+        text={text}
+        onTextChange={setText}
+        onGenerate={tts.generateAudio}
+        onPlay={tts.playGeneratedAudio}
+        hasAudio={tts.hasAudio}
+        isLoading={tts.isLoading}
+        error={tts.error}
       />
-      <div style={{ marginTop: 10 }}>
-        <button onClick={getTtsAudio}>Generate TTS</button>
-        <button onClick={playTts} disabled={!audioSrc} style={{ marginLeft: 10 }}>
-          Play TTS
-        </button>
-      </div>
 
-      <hr />
+      <hr style={{ margin: '32px 0', border: 'none', borderTop: '2px solid #eee' }} />
 
-      <h3>🎤 Child Repeats</h3>
-      {!recording && <button onClick={startRecording}>Start Recording</button>}
-      {recording && (
-        <button onClick={stopRecording} style={{ backgroundColor: 'red', color: 'white' }}>
-          Stop Recording
-        </button>
-      )}
+      {/* Recording Section */}
+      <RecordingSection
+        isRecording={recording.isRecording}
+        onStartRecording={recording.startAudioRecording}
+        onStopRecording={recording.stopAudioRecording}
+        onFileUpload={recording.handleFileUpload}
+        onTriggerFileUpload={recording.triggerFileUpload}
+        fileInputRef={recording.fileInputRef}
+        error={recording.error}
+      />
 
-      <div style={{ marginTop: 10 }}>
-        <p>Or upload audio file:</p>
-        <input
-          type="file"
-          accept="audio/*"
-          onChange={handleFileUpload}
-          ref={fileInputRef}
-          style={{ display: 'none' }}
-        />
-        <button onClick={() => fileInputRef.current.click()}>
-          Upload Audio File
-        </button>
-      </div>
+      {/* Audio Playback and Assessment */}
+      <AudioPlayback
+        audioUrl={recording.audioUrl}
+        onAssess={handleAssessment}
+        isAssessing={assessment.isAssessing}
+        onClear={recording.clearAudio}
+      />
 
-      {(recordedAudioUrl || uploadedFile) && (
-        <div style={{ marginTop: 10 }}>
-          <p>Recorded Audio:</p>
-          <audio controls src={recordedAudioUrl}></audio>
-          <br />
-          <button onClick={uploadForAssessment} style={{ marginTop: 10 }}>
-            Send for Assessment
-          </button>
+      {/* Assessment Error Display */}
+      {assessment.error && (
+        <div style={{
+          marginTop: '16px',
+          padding: '12px',
+          backgroundColor: '#f8d7da',
+          color: '#721c24',
+          borderRadius: '8px',
+          border: '1px solid #f5c6cb'
+        }}>
+          Assessment Error: {assessment.error}
         </div>
       )}
+
+      {/* Assessment Results */}
+      <AssessmentResults
+        result={assessment.lastResult}
+        getScoreMessage={assessment.getScoreMessage}
+        formatScore={assessment.formatScore}
+      />
     </div>
   );
 }
